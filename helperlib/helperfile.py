@@ -9,6 +9,12 @@ from torch import nn
 
 d2l = sys.modules[__name__]
 
+def cpu():
+    """Get the CPU device.
+
+    Defined in :numref:`sec_use_gpu`"""
+    return torch.device('cpu')
+
 def use_svg_display():  
     """Use the svg format to display a plot in Jupyter."""
     backend_inline.set_matplotlib_formats('svg')
@@ -192,6 +198,10 @@ class Trainer(d2l.HyperParameters):  #@save
         self.save_hyperparameters()
         assert num_gpus == 0, 'No GPU support yet'
 
+    def prepare_batch(self, batch):
+        return batch
+
+
     def prepare_data(self, data):
         self.train_dataloader = data.train_dataloader()
         self.val_dataloader = data.val_dataloader()
@@ -215,4 +225,101 @@ class Trainer(d2l.HyperParameters):  #@save
             self.fit_epoch()
 
     def fit_epoch(self):
-        raise NotImplementedError
+        self.model.train()
+        for batch in self.train_dataloader:
+            loss = self.model.training_step(self.prepare_batch(batch))
+            self.optim.zero_grad()
+            with torch.no_grad():
+                loss.backward()
+                if self.gradient_clip_val > 0: 
+                    self.clip_gradients(self.gradient_clip_val, self.model)
+                self.optim.step()
+            self.train_batch_idx += 1
+        if self.val_dataloader is None:
+            return
+        self.model.eval()
+        for batch in self.val_dataloader:
+            with torch.no_grad():
+                self.model.validation_step(self.prepare_batch(batch))
+            self.val_batch_idx += 1
+    
+class SyntheticRegressionData(d2l.DataModule): 
+    """Synthetic data for linear regression."""
+    def __init__(self, w, b, noise=0.01, num_train=1000, num_val=1000,
+                 batch_size=32):
+        super().__init__()
+        self.save_hyperparameters()
+        n = num_train + num_val
+        self.X = torch.randn(n, len(w))
+        noise = torch.randn(n, 1) * noise
+        self.y = torch.matmul(self.X, w.reshape((-1, 1))) + b + noise
+
+    def get_dataloader(self, train):
+        i = slice(0, self.num_train) if train else slice(self.num_train, None)
+        return self.get_tensorloader((self.X, self.y), train, i)
+    
+    def get_tensorloader(self, tensors, train, indices=slice(0, None)):
+        tensors = tuple(a[indices] for a in tensors)
+        dataset = torch.utils.data.TensorDataset(*tensors)
+        return torch.utils.data.DataLoader(dataset, self.batch_size,
+                                        shuffle=train)
+
+    def get_dataloader(self, train):
+        """Defined in :numref:`sec_synthetic-regression-data`"""
+        i = slice(0, self.num_train) if train else slice(self.num_train, None)
+        return self.get_tensorloader((self.X, self.y), train, i)
+
+class LinearRegressionScratch(d2l.Module):
+    """The linear regression model implemented from scratch."""
+    def __init__(self, num_inputs, lr, sigma=0.01):
+        super().__init__()
+        self.save_hyperparameters()
+        self.w = torch.normal(0, sigma, (num_inputs, 1), requires_grad=True)
+        self.b = torch.zeros(1, requires_grad=True)
+
+    def forward(self, X):
+        return torch.matmul(X, self.w) + self.b
+    
+    def loss(self, y_hat, y):
+        l = (y_hat - y) ** 2 / 2
+        return l.mean()
+    
+    def configure_optimizers(self):
+        return SGD([self.w, self.b], self.lr)
+
+class SGD(d2l.HyperParameters):  
+    """Minibatch stochastic gradient descent."""
+    def __init__(self, params, lr):
+        self.save_hyperparameters()
+
+    def step(self):
+        for param in self.params:
+            param -= self.lr * param.grad
+
+    def zero_grad(self):
+        for param in self.params:
+            if param.grad is not None:
+                param.grad.zero_()
+
+class LinearRegression(d2l.Module):  #@save
+    """The linear regression model implemented with high-level APIs."""
+    def __init__(self, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net = nn.LazyLinear(1)
+        self.net.weight.data.normal_(0, 0.01)
+        self.net.bias.data.fill_(0)
+
+    def forward(self, X):
+        return self.net(X)
+    
+    def loss(self, y_hat, y):
+        fn = nn.MSELoss()
+        return fn(y_hat, y)
+
+    
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), self.lr)
+    
+    def get_w_b(self):
+        return (self.net.weight.data, self.net.bias.data)
