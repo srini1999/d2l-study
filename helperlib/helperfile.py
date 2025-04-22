@@ -6,6 +6,16 @@ import collections
 from IPython import display
 import torch
 from torch import nn
+import torchvision
+from torchvision import transforms
+from torch.nn import functional as F
+import os
+import requests
+import hashlib
+import zipfile
+import tarfile
+DATA_HUB = dict()
+DATA_URL = 'http://d2l-data.s3-accelerate.amazonaws.com/'
 
 d2l = sys.modules[__name__]
 
@@ -130,10 +140,10 @@ class ProgressBoard(d2l.HyperParameters):
 
 class Module(nn.Module, d2l.HyperParameters):
     """The base class of models."""
-    def __init__(self, plot_train_per_epoch=2, plot_valid_per_epoch=1):
-        super().__init__()
+    def __init__(self, max_epochs, num_gpus=0, gradient_clip_val=0):
         self.save_hyperparameters()
-        self.board = ProgressBoard()
+        self.gpus = [d2l.gpu(i) for i in range(min(num_gpus, d2l.num_gpus()))]
+
 
     def loss(self, y_hat, y):
         raise NotImplementedError
@@ -169,7 +179,7 @@ class Module(nn.Module, d2l.HyperParameters):
         self.plot('loss', l, train=False)
 
     def configure_optimizers(self):
-        raise NotImplementedError
+        return torch.optim.SGD(self.parameters(), lr=self.lr)
     
 class DataModule(d2l.HyperParameters): 
     """The base class of data."""
@@ -199,6 +209,8 @@ class Trainer(d2l.HyperParameters):  #@save
         assert num_gpus == 0, 'No GPU support yet'
 
     def prepare_batch(self, batch):
+        if self.gpus:
+            batch = [a.to(self.gpus[0]) for a in batch]
         return batch
 
 
@@ -212,6 +224,8 @@ class Trainer(d2l.HyperParameters):  #@save
     def prepare_model(self, model):
         model.trainer = self
         model.board.xlim = [0, self.max_epochs]
+        if self.gpus:
+            model.to(self.gpus[0])
         self.model = model
 
     def fit(self, model, data):
@@ -323,3 +337,131 @@ class LinearRegression(d2l.Module):  #@save
     
     def get_w_b(self):
         return (self.net.weight.data, self.net.bias.data)
+    
+class FashionMNIST(d2l.DataModule):  
+    """The Fashion-MNIST dataset."""
+    def __init__(self, batch_size=64, resize=(28, 28)):
+        super().__init__()
+        self.save_hyperparameters()
+        trans = transforms.Compose([transforms.Resize(resize),
+                                    transforms.ToTensor()])
+        self.train = torchvision.datasets.FashionMNIST(
+            root=self.root, train=True, transform=trans, download=False)
+        self.val = torchvision.datasets.FashionMNIST(
+            root=self.root, train=False, transform=trans, download=False)
+    
+    def text_labels(self, indices):
+        """Return text labels."""
+        labels = ['t-shirt', 'trouser', 'pullover', 'dress', 'coat',
+                'sandal', 'shirt', 'sneaker', 'bag', 'ankle boot']
+        return [labels[int(i)] for i in indices]
+    
+    def get_dataloader(self, train):
+        data = self.train if train else self.val
+        return torch.utils.data.DataLoader(data, self.batch_size, shuffle=train,
+                                        num_workers=self.num_workers)
+    
+    def visualize(self, batch, nrows=1, ncols=8, labels=[]):
+        X, y = batch
+        if not labels:
+            labels = self.text_labels(y)
+        d2l.show_images(X.squeeze(1), nrows, ncols, titles=labels)
+    
+
+def show_images(imgs, num_rows, num_cols, titles=None, scale=1.5):
+    """Plot a list of images.
+
+    Defined in :numref:`sec_utils`"""
+    figsize = (num_cols * scale, num_rows * scale)
+    _, axes = d2l.plt.subplots(num_rows, num_cols, figsize=figsize)
+    axes = axes.flatten()
+    for i, (ax, img) in enumerate(zip(axes, imgs)):
+        try:
+            img = d2l.numpy(img)
+        except:
+            pass
+        ax.imshow(img)
+        ax.axes.get_xaxis().set_visible(False)
+        ax.axes.get_yaxis().set_visible(False)
+        if titles:
+            ax.set_title(titles[i])
+    return axes
+
+class Classifier(d2l.Module): 
+    """The base class of classification models."""
+    def validation_step(self, batch):
+        Y_hat = self(*batch[:-1])
+        self.plot('loss', self.loss(Y_hat, batch[-1]), train=False)
+        self.plot('acc', self.accuracy(Y_hat, batch[-1]), train=False)
+    
+    def accuracy(self, Y_hat, Y, averaged=True):
+        """Compute the number of correct predictions."""
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        preds = Y_hat.argmax(axis=1).type(Y.dtype)
+        compare = (preds == Y.reshape(-1)).type(torch.float32)
+        return compare.mean() if averaged else compare
+    
+    def loss(self, Y_hat, Y, averaged=True):
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        Y = Y.reshape((-1,))
+        return F.cross_entropy(
+            Y_hat, Y, reduction='mean' if averaged else 'none')
+
+    
+class SoftmaxRegression(d2l.Classifier):
+    """The softmax regression model."""
+    def __init__(self, num_outputs, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net = nn.Sequential(nn.Flatten(),
+                                 nn.LazyLinear(num_outputs))
+
+    def forward(self, X):
+        return self.net(X)
+    
+def download(url, folder='../data', sha1_hash=None):
+    """Download a file to folder and return the local filepath.
+
+    Defined in :numref:`sec_utils`"""
+    if not url.startswith('http'):
+        # For back compatability
+        url, sha1_hash = DATA_HUB[url]
+    os.makedirs(folder, exist_ok=True)
+    fname = os.path.join(folder, url.split('/')[-1])
+    # Check if hit cache
+    if os.path.exists(fname) and sha1_hash:
+        sha1 = hashlib.sha1()
+        with open(fname, 'rb') as f:
+            while True:
+                data = f.read(1048576)
+                if not data:
+                    break
+                sha1.update(data)
+        if sha1.hexdigest() == sha1_hash:
+            return fname
+    # Download
+    print(f'Downloading {fname} from {url}...')
+    r = requests.get(url, stream=True, verify=True)
+    with open(fname, 'wb') as f:
+        f.write(r.content)
+    return fname
+
+def extract(filename, folder=None):
+    """Extract a zip/tar file into folder.
+
+    Defined in :numref:`sec_utils`"""
+    base_dir = os.path.dirname(filename)
+    _, ext = os.path.splitext(filename)
+    assert ext in ('.zip', '.tar', '.gz'), 'Only support zip/tar files.'
+    if ext == '.zip':
+        fp = zipfile.ZipFile(filename, 'r')
+    else:
+        fp = tarfile.open(filename, 'r')
+    if folder is None:
+        folder = base_dir
+    fp.extractall(folder)
+
+def apply_init(self, inputs, init=None):
+    self.forward(*inputs)
+    if init is not None:
+        self.net.apply(init)
